@@ -14,9 +14,12 @@ from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 from pyearth import Earth
 import click
 
+from joblib import Parallel, delayed
+
 import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
 
 class EarthClassifier(BaseEstimator):
     def __init__(self, **params):
@@ -61,16 +64,18 @@ def preprocess_rf_params(p):
     keys = ['n_estimators', 'min_samples_split', 'min_samples_leaf']
     for k in keys:
         p[k] = int(p[k])
+    p['n_jobs'] = -1
     return p
 
 def get_datasets(filenames):
     datasets = {}
     for filename in filenames:
-
         try:
             if filename.endswith('arff'):
                 data = arff.load(open(filename))['data']
+                data = pd.DataFrame(data)
                 data = autoclean(data)
+                data = data.values
             else:
                 data = pd.read_csv(filename)
                 data = autoclean(data)
@@ -82,7 +87,7 @@ def get_datasets(filenames):
             if X.shape[1] == 0:
                 continue
             task = guess_task(y)
-            logger.info('Task for {} : {} ({})'.format(filename, task, y))
+            logger.info('Task for {} : {}'.format(filename, task, y))
             datasets[filename] = X, y, task
     return datasets
 
@@ -111,10 +116,10 @@ def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random
         params = preprocess(params)
         if task == 'classification':
             skf = StratifiedKFold(y, n_folds, random_state=random_state)
-            eval_func = lambda y_pred, y: (y_pred != y).mean()
+            eval_func = lambda y_pred, y: float((y_pred != y).mean())
         else:
             skf = KFold(len(X), n_folds, random_state=random_state)
-            eval_func = lambda y_pred, y: ((y_pred - ytrain)**2).mean()
+            eval_func = lambda y_pred, y: float(((y_pred - y)**2).mean())
         results = []
         for train, test in skf:
             results.append(fit_model(X[train], y[train], X[test], y[test], CLS, eval_func, **params))
@@ -144,8 +149,9 @@ def main():
 @click.option('--task_filter', default='none', help='classification/regression/all', required=False)
 @click.option('--nb_datasets', default=None, help='Max Nb of datasets', required=False)
 @click.option('--save_results', default=True, help='Save results in DB', required=False)
+@click.option('--n_jobs', default=-1, help='n_jobs', required=False)
 @click.command()
-def run(pattern, max_evals, n_folds, random_state, task_filter, nb_datasets, save_results):
+def run(pattern, max_evals, n_folds, random_state, task_filter, nb_datasets, save_results, n_jobs):
     from lightjob.cli import load_db
     from lightjob.db import SUCCESS
     import glob
@@ -154,11 +160,12 @@ def run(pattern, max_evals, n_folds, random_state, task_filter, nb_datasets, sav
     filenames = glob.glob(pattern)
     datasets = get_datasets(filenames)
     
+    logger.info('total number of datasets before filtering : {}'.format(len(datasets)))
     datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if X.shape[1] > 0}
     datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if X.shape[0] > 100}
-
     if task_filter != 'none':
         datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if task == task_filter}
+    logger.info('total number of datasets after filtering : {}'.format(len(datasets)))
     datasets = datasets.items()
     if nb_datasets is not None:
         datasets = datasets[0:nb_datasets]
@@ -168,42 +175,67 @@ def run(pattern, max_evals, n_folds, random_state, task_filter, nb_datasets, sav
         trials = Trials()
         best = fmin(fn=fn, space=params, algo=tpe.suggest, max_evals=max_evals, trials=trials)
         return best, trials
-
-    def get_results(datasets, model_getter, random_state=42):
+    
+    def get_results(datasets, model_getter, random_state=42, n_jobs=1):
+        datasets_new = []
         for filename, (X, y, task) in datasets:
             CLS = model_getter[task]['cls']
-            preprocess = model_getter[task].get('preprocess', lambda p:p)
-            params = model_getter[task]['params']
+            length = len(db.jobs_with(model=CLS.__name__, seed=random_state, task=task, dataset=filename))
+            if length >= max_evals:
+                logger.info('Skipping job on {}...already exists'.format(filename))
+                continue
+            else:
+                datasets_new.append((filename, (X, y, task)))
+        results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
+        for r in results:
+            for r_indiv in r:
+                yield r_indiv
+
+    def get_result(filename, X, y, task, model_getter):
+        CLS = model_getter['cls']
+        preprocess = model_getter.get('preprocess', lambda p:p)
+        params = model_getter['params']
+        try:
             best, trials = hyper_optim(CLS, X, y, params, task=task, preprocess=preprocess, random_state=random_state)
-            trials_params = [trial['result']['params'] for trial in trials.trials]
-            for result, loss, params in zip(trials.results, trials.losses(), trials_params):
-                yield {'params': params, 
-                       'loss': loss, 
-                       'result': result, 
-                       'model': CLS.__name__, 
-                       'seed': random_state,
-                       'task': task,
-                       'dataset': filename}
+        except Exception as ex:
+            logger.error('Exception : {}, ignoring.'.format(ex))
+            return []
+        trials_params = [trial['result']['params'] for trial in trials.trials]
+        outs = []
+        for result, loss, params in zip(trials.results, trials.losses(), trials_params):
+            out = {'params': params, 
+                   'loss': loss, 
+                   'result': result, 
+                   'model': CLS.__name__, 
+                   'seed': random_state,
+                   'task': task,
+                   'dataset': filename}
+            outs.append(out)
+        return outs
+
     results = []
+    logger.info('Running Earth...')
     model_getter = {
             'classification': {'cls': EarthClassifier, 'params': earth_params}, 
             'regression': {'cls': Earth, 'params': earth_params}
     }
-    for result in get_results(datasets, model_getter):
+    for result in get_results(datasets, model_getter, n_jobs=n_jobs):
         if save_results:
+            print(result)
             db.safe_add_job(result, state=SUCCESS)
     model_getter = {
             'classification': {'cls': RandomForestClassifier, 'params': rf_classif_params, 'preprocess': preprocess_rf_params}, 
             'regression': {'cls': RandomForestRegressor, 'params': rf_reg_params, 'preprocess': preprocess_rf_params}
     }
-    for result in get_results(datasets, model_getter):
+    logger.info('Running RF...')
+    for result in get_results(datasets, model_getter, n_jobs=1):
         if save_results:
             db.safe_add_job(result, state=SUCCESS)
 
 @click.command()
 @click.option('--out', default='out.html', help='Filename to output', required=False)
-@click.option('--task', default='regression', help='task', required=False)
-def plot(out, task):
+@click.option('--task_filter', default='regression', help='task', required=False)
+def plot(out, task_filter):
     from bokeh.charts import Scatter, show, Bar
     from bokeh.io import output_file, vplot
     from lightjob.cli import load_db
@@ -216,20 +248,24 @@ def plot(out, task):
     results = [j['content'] for j in jobs]
     assert len(results) > 0
     df = pd.DataFrame(results)
-    df = df[df['task'] == task]
+    df = df[df['task'] == task_filter]
     baseline = df['model'].iloc[0]
     df['avg_train_loss'] = df['result'].apply(lambda r:np.mean(r['score_train']))
     df['avg_test_loss'] = df['result'].apply(lambda r:np.mean(r['score_test']))
     df['test_loss'] = df['loss']
+    logger.info(df['dataset'])
 
     charts = []
     for loss in ('avg_train_loss', 'test_loss'):
         baseline_loss_max = df[df['model'] == baseline][['dataset', loss]].groupby('dataset').agg(np.max)
         baseline_loss_min = df[df['model'] == baseline][['dataset', loss]].groupby('dataset').agg(np.min)
         def normalize(row):
+            if task_filter == 'classification':
+                return row[loss]
             loss_normalized = row[loss]
             loss_normalized /= baseline_loss_max.loc[row['dataset']]
             return loss_normalized
+        
         df[loss + '_normalized'] = df.apply(normalize, axis=1)
         df['dataset'] = df['dataset'].apply(lambda c:os.path.basename(c).replace('.data', ''))
         chart = Bar(df, label='dataset', values=loss + '_normalized', agg='min', group='model', legend='top_right', plot_width=1200, plot_height=800)
