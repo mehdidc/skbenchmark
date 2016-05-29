@@ -67,28 +67,33 @@ def preprocess_rf_params(p):
     p['n_jobs'] = -1
     return p
 
-def get_datasets(filenames):
+def get_datasets(filenames, task=None):
     datasets = {}
     for filename in filenames:
+        logger.info('Processing {}'.format(filename))
         try:
             if filename.endswith('arff'):
                 data = arff.load(open(filename))['data']
                 data = pd.DataFrame(data)
-                data = autoclean(data)
-                data = data.values
             else:
                 data = pd.read_csv(filename)
-                data = autoclean(data)
-                data = data.values
+                logger.info(data.shape)
         except Exception as ex:
             logger.error('error reading dataset : {}, ignoring, reason : {}'.format(filename, str(ex)))
-        else:
-            X, y = data[:, 0:-1], data[:, -1]
-            if X.shape[1] == 0:
-                continue
+        try:
+            data = autoclean(data)
+        except Exception as ex:
+            logger.error('error cleaning dataset : {}, ignoring, reason : {}'.format(filename, str(ex)))
+        data = data.values
+        X, y = data[:, 0:-1], data[:, -1]
+        if X.shape[1] <= 1:
+            logger.info('{} incorrect inputs shape : {}'.format(filename, X.shape))
+            continue
+        logger.info(X.shape)
+        if task is None:
             task = guess_task(y)
-            logger.info('Task for {} : {}'.format(filename, task, y))
-            datasets[filename] = X, y, task
+        logger.info('Task for {} : {}'.format(filename, task, y))
+        datasets[filename] = X, y, task
     return datasets
 
 def guess_task(y):
@@ -143,32 +148,37 @@ def main():
 
 
 @click.option('--pattern', default='uci/**/*.data', help='Filenames pattern for CSV datasets', required=False)
+@click.option('--exclude', default='', help='Filenames pattern for excluding CSV datasets', required=False)
 @click.option('--max_evals', default=10, help='Max hyperopt evaluations', required=False)
 @click.option('--n_folds', default=5, help='Nb of folds', required=False)
 @click.option('--random_state', default=42, help='Seed', required=False)
 @click.option('--task_filter', default='none', help='classification/regression/all', required=False)
+@click.option('--force_task', default=None, help='classification/regression/all', required=False)
 @click.option('--nb_datasets', default=None, help='Max Nb of datasets', required=False)
 @click.option('--save_results', default=True, help='Save results in DB', required=False)
 @click.option('--n_jobs', default=-1, help='n_jobs', required=False)
 @click.command()
-def run(pattern, max_evals, n_folds, random_state, task_filter, nb_datasets, save_results, n_jobs):
+def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_task, nb_datasets, save_results, n_jobs):
     from lightjob.cli import load_db
     from lightjob.db import SUCCESS
     import glob
     db = load_db()
 
     filenames = glob.glob(pattern)
-    datasets = get_datasets(filenames)
+    filenames_exclude = set(glob.glob(exclude))
+    filenames = filter(lambda f:f not in filenames_exclude, filenames)
+
+    logger.info('total number of datasets before filtering : {}'.format(len(filenames)))
+    datasets = get_datasets(filenames, task=force_task)
     
-    logger.info('total number of datasets before filtering : {}'.format(len(datasets)))
     datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if X.shape[1] > 0}
     datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if X.shape[0] > 100}
     if task_filter != 'none':
         datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if task == task_filter}
-    logger.info('total number of datasets after filtering : {}'.format(len(datasets)))
     datasets = datasets.items()
     if nb_datasets is not None:
         datasets = datasets[0:nb_datasets]
+    logger.info('total number of datasets after filtering : {}'.format(len(datasets)))
     def hyper_optim(CLS, X, y, params, n_folds=n_folds, task='classification', preprocess=lambda p:p, random_state=random_state):
         logger.debug('X shape : {}, y shape : {}'.format(X.shape, y.shape))
         fn = build_fit_function_kfold(X, y, CLS, n_folds=n_folds, preprocess=preprocess, task=task, random_state=random_state)
