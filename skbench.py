@@ -245,37 +245,47 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
 @click.command()
 @click.option('--out', default='out.html', help='Filename to output', required=False)
 @click.option('--task_filter', default='regression', help='task', required=False)
-def plot(out, task_filter):
+@click.option('--dataset_pattern', default=None, help='patttern for dataset', required=False)
+@click.option('--out_df', default=None, help='out dataframe csv', required=False)
+def plot(out, task_filter, dataset_pattern, out_df):
     from bokeh.charts import Scatter, show, Bar
     from bokeh.io import output_file, vplot
     from lightjob.cli import load_db
     from lightjob.db import SUCCESS
     import os
     import pandas as pd
+    import re
     output_file(out)
     db = load_db()
     jobs = list(db.jobs_with(state=SUCCESS))
+    
+    if dataset_pattern is not None:
+        expr = re.compile(dataset_pattern)
+        def filter_data(j):
+            dataset = j['content']['dataset']
+            return expr.search(dataset)
+        jobs = filter(filter_data, jobs)
+
     results = [j['content'] for j in jobs]
     assert len(results) > 0
     df = pd.DataFrame(results)
     df = df[df['task'] == task_filter]
-    baseline = df['model'].iloc[0]
-    df['avg_train_loss'] = df['result'].apply(lambda r:np.mean(r['score_train']))
-    df['avg_test_loss'] = df['result'].apply(lambda r:np.mean(r['score_test']))
-    df['test_loss'] = df['loss']
+    baseline = df['model'].iloc[0] # take any model as baseline
+    df['avg_train_loss'] = df['result'].apply(lambda r:np.mean(np.sqrt(r['score_train']))) # mean in K-fold
+    df['avg_test_loss'] = df['result'].apply(lambda r:np.mean(np.sqrt(r['score_test']))) # mean in K-fold
     logger.info(df['dataset'])
-
+    df.to_csv(out_df)
     charts = []
-    for loss in ('avg_train_loss', 'test_loss'):
-        baseline_loss_max = df[df['model'] == baseline][['dataset', loss]].groupby('dataset').agg(np.max)
-        baseline_loss_min = df[df['model'] == baseline][['dataset', loss]].groupby('dataset').agg(np.min)
+    for loss in ('avg_train_loss', 'avg_test_loss'):
+        baseline_loss_max = df[df['model'] == baseline][['dataset', loss]].groupby('dataset').agg(np.max) # max loss for the baseline model per dataset
+        baseline_loss_min = df[df['model'] == baseline][['dataset', loss]].groupby('dataset').agg(np.min) # min loss for the baseline model per dataset
         def normalize(row):
             if task_filter == 'classification':
+                # classification is already 'normalized'
                 return row[loss]
             loss_normalized = row[loss]
             loss_normalized /= baseline_loss_max.loc[row['dataset']]
             return loss_normalized
-        
         df[loss + '_normalized'] = df.apply(normalize, axis=1)
         df['dataset'] = df['dataset'].apply(lambda c:os.path.basename(c).replace('.data', ''))
         chart = Bar(df, label='dataset', values=loss + '_normalized', agg='min', group='model', legend='top_right', plot_width=1200, plot_height=800)
