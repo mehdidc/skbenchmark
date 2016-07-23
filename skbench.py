@@ -16,6 +16,8 @@ import click
 
 from joblib import Parallel, delayed
 
+import json
+
 import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -117,14 +119,21 @@ def fit_model(Xtrain, ytrain, Xtest, ytest, CLS, eval_func, **params):
 
 def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random_state=42, task='classification'):
     def fit_model_(params):
-
         params = preprocess(params)
+        print(json.dumps(params, indent=4))
         if task == 'classification':
-            skf = StratifiedKFold(y, n_folds, random_state=random_state)
+            skf = StratifiedKFold(y, n_folds, shuffle=True, random_state=random_state)
             eval_func = lambda y_pred, y: float((y_pred != y).mean())
+            def eval_func(y_pred, y):
+                err = (y_pred != y).mean()
+                err = float(err)
+                return err
         else:
             skf = KFold(len(X), n_folds, random_state=random_state)
-            eval_func = lambda y_pred, y: float(((y_pred - y)**2).mean())
+            def eval_func(y_pred, y):
+                err = ((y_pred - y)**2).mean()
+                err = float(err)
+                return err
         results = []
         for train, test in skf:
             results.append(fit_model(X[train], y[train], X[test], y[test], CLS, eval_func, **params))
@@ -196,7 +205,8 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
                 continue
             else:
                 datasets_new.append((filename, (X, y, task)))
-        results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
+        #results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
+        results = [get_result(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets]
         for r in results:
             for r_indiv in r:
                 yield r_indiv
@@ -224,6 +234,15 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
         return outs
 
     results = []
+    model_getter = {
+            'classification': {'cls': RandomForestClassifier, 'params': rf_classif_params, 'preprocess': preprocess_rf_params}, 
+            'regression': {'cls': RandomForestRegressor, 'params': rf_reg_params, 'preprocess': preprocess_rf_params}
+    }
+    logger.info('Running RF...')
+    for result in get_results(datasets, model_getter, n_jobs=1):
+        if save_results:
+            db.safe_add_job(result, state=SUCCESS)
+
     logger.info('Running Earth...')
     model_getter = {
             'classification': {'cls': EarthClassifier, 'params': earth_params}, 
@@ -233,14 +252,7 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
         if save_results:
             print(result)
             db.safe_add_job(result, state=SUCCESS)
-    model_getter = {
-            'classification': {'cls': RandomForestClassifier, 'params': rf_classif_params, 'preprocess': preprocess_rf_params}, 
-            'regression': {'cls': RandomForestRegressor, 'params': rf_reg_params, 'preprocess': preprocess_rf_params}
-    }
-    logger.info('Running RF...')
-    for result in get_results(datasets, model_getter, n_jobs=1):
-        if save_results:
-            db.safe_add_job(result, state=SUCCESS)
+
 
 @click.command()
 @click.option('--out', default='out.html', help='Filename to output', required=False)
@@ -271,8 +283,9 @@ def plot(out, task_filter, dataset_pattern, out_df):
     df = pd.DataFrame(results)
     df = df[df['task'] == task_filter]
     baseline = df['model'].iloc[0] # take any model as baseline
-    df['avg_train_loss'] = df['result'].apply(lambda r:np.mean(np.sqrt(r['score_train']))) # mean in K-fold
-    df['avg_test_loss'] = df['result'].apply(lambda r:np.mean(np.sqrt(r['score_test']))) # mean in K-fold
+    df['avg_train_loss'] = df['result'].apply(lambda r:np.mean(r['score_train'])) # mean in K-fold
+    df['avg_test_loss'] = df['result'].apply(lambda r:np.mean(r['score_test'])) # mean in K-fold
+    df.to_csv('out.csv')
     logger.info(df['dataset'])
     df.to_csv(out_df)
     charts = []
