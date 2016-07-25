@@ -1,35 +1,62 @@
 import arff
 import pandas as pd
+import time
+from joblib import Parallel, delayed
+import json
+import logging
+
 from pyearth import Earth
+
 from datacleaner import autoclean
 import numpy as np
+
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.cross_validation import train_test_split, StratifiedKFold, KFold
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-import time
+from sklearn.multiclass import OneVsRestClassifier
 
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 from pyearth import Earth
 import click
 
-from joblib import Parallel, delayed
 
-import json
-
-import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+class RegressionClassifier(BaseEstimator):
+    def __init__(self, base_estimator=RandomForestClassifier()):
+        self.clf = base_estimator
+        self._label_enc = LabelEncoder()
+        self._one_hot_enc = OneHotEncoder(sparse=False)
+ 
+    def fit(self, X, y):
+        y = self._label_enc.fit_transform(y)
+        y = self._one_hot_enc.fit_transform(y[:, np.newaxis])
+        self.clf.fit(X, y)
+        return self
+
+    def transform(self, X):
+        return self.clf.transform(X)
+ 
+    def predict(self, X):
+        y = self.clf.predict(X)
+        y = y.argmax(axis=1)
+        y = self._label_enc.inverse_transform(y)
+        return y
+ 
 
 class EarthClassifier(BaseEstimator):
     def __init__(self, **params):
         self.clf = Pipeline([
-            ('earth', Earth(**params)),
-            ('logistic', LogisticRegression())])
+                ('earth', (Earth(**params))),
+                ('logistic', LogisticRegression())
+            ])
  
     def fit(self, X, y):
+        print(set(y))
         self.clf.fit(X, y)
  
     def predict(self, X):
@@ -37,6 +64,21 @@ class EarthClassifier(BaseEstimator):
  
     def predict_proba(self, X):
         return self.clf.predict_proba(X)
+
+class EarthOneVsRestClassifier(BaseEstimator):
+
+    def __init__(self, **params):
+        self.clf = OneVsRestClassifier(EarthClassifier(**params))
+
+    def fit(self, X, y):
+        return self.clf.fit(X, y)
+ 
+    def predict(self, X):
+        return self.clf.predict(X)
+ 
+    def predict_proba(self, X):
+        return self.clf.predict_proba(X)
+
 
 earth_params = dict(
     max_terms=hp.quniform('max_terms', 10, 100, 1), 
@@ -56,6 +98,7 @@ rf_reg_params = dict(
     n_estimators=hp.quniform('n_estimators', 10, 100, 1),
     min_samples_split=hp.quniform('min_samples_split', 2, 20, 1),
     min_samples_leaf=hp.quniform('min_samples_leaf', 2, 20, 1),
+    max_depth=hp.choice('max_depth', (hp.quniform('max_depth_val', 5, 50, 1), None)),
     bootstrap=hp.choice('bootstrap', (True, False))
 )
 
@@ -205,8 +248,8 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
                 continue
             else:
                 datasets_new.append((filename, (X, y, task)))
-        #results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
-        results = [get_result(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets]
+        results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
+        #results = [get_result(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets]
         for r in results:
             for r_indiv in r:
                 yield r_indiv
@@ -245,7 +288,7 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
 
     logger.info('Running Earth...')
     model_getter = {
-            'classification': {'cls': EarthClassifier, 'params': earth_params}, 
+            'classification': {'cls': EarthOneVsRestClassifier, 'params': earth_params}, 
             'regression': {'cls': Earth, 'params': earth_params}
     }
     for result in get_results(datasets, model_getter, n_jobs=n_jobs):
