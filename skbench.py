@@ -4,6 +4,7 @@ import time
 from joblib import Parallel, delayed
 import json
 import logging
+import re
 
 from datacleaner import autoclean
 import numpy as np
@@ -17,6 +18,7 @@ import click
 
 from models import MODELS
 
+
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
@@ -28,17 +30,25 @@ def get_datasets(filenames, task=None):
             if filename.endswith('arff'):
                 data = arff.load(open(filename))['data']
                 data = pd.DataFrame(data)
+                data = data.values
+                X, y = data[:, 0:-1], data[:, -1]
+            elif filename.endswith('npz'):
+                data = np.load(filename)
+                X = data['X']
+                if len(X.shape) > 2:
+                    X = X.reshape((X.shape[0], -1))
+                y = data['y']
             else:
                 data = pd.read_csv(filename)
-                logger.info(data.shape)
+                data = data.values
+                X, y = data[:, 0:-1], data[:, -1]
+
         except Exception as ex:
             logger.error('error reading dataset : {}, ignoring, reason : {}'.format(filename, str(ex)))
         try:
             data = autoclean(data)
         except Exception as ex:
             logger.error('error cleaning dataset : {}, ignoring, reason : {}'.format(filename, str(ex)))
-        data = data.values
-        X, y = data[:, 0:-1], data[:, -1]
         if X.shape[1] <= 1:
             logger.info('{} incorrect inputs shape : {}'.format(filename, X.shape))
             continue
@@ -50,7 +60,9 @@ def get_datasets(filenames, task=None):
     return datasets
 
 def guess_task(y):
-    for element in set(y):
+    if isinstance(y, np.ndarray):
+        y = y.flatten().tolist()
+    for element in set(tuple(y)):
         if type(element) == str:
             break
         if int(element) == element:
@@ -72,6 +84,7 @@ def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random
     def fit_model_(params):
         params = preprocess(params)
         print(json.dumps(params, indent=4))
+        # classification error as EVALUATION if classification
         if task == 'classification':
             skf = StratifiedKFold(y, n_folds, shuffle=True, random_state=random_state)
             eval_func = lambda y_pred, y: float((y_pred != y).mean())
@@ -80,6 +93,7 @@ def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random
                 err = float(err)
                 return err
         else:
+            # Mean squared error(MSE) as EVALUATION if regression
             skf = KFold(len(X), n_folds, random_state=random_state)
             def eval_func(y_pred, y):
                 err = ((y_pred - y)**2).mean()
