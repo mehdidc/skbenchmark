@@ -5,6 +5,8 @@ from joblib import Parallel, delayed
 import json
 import logging
 import re
+import uuid
+import pickle
 
 from datacleaner import autoclean
 import numpy as np
@@ -78,7 +80,12 @@ def fit_model(Xtrain, ytrain, Xtest, ytest, CLS, eval_func, **params):
     score_train = eval_func(model.predict(Xtrain), ytrain)
     delta_t = time.time() - start
     score_test = eval_func(model.predict(Xtest), ytest)
-    return {'loss': score_test, 'score_train': score_train, 'score_test': score_test, 'train_time': delta_t, 'status': STATUS_OK}
+    return {'loss': score_test,
+            'score_train': score_train,
+            'score_test': score_test, 
+            'train_time': delta_t, 
+            'model': model,
+            'status': STATUS_OK}
 
 def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random_state=42, task='classification'):
     def fit_model_(params):
@@ -102,6 +109,11 @@ def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random
         results = []
         for train, test in skf:
             results.append(fit_model(X[train], y[train], X[test], y[test], CLS, eval_func, **params))
+        
+        id_ = str(uuid.uuid4())
+        models = [r['model'] for r in results]
+        with open('dump/{}.pkl'.format(id_), 'w') as fd:
+            pickle.dump(models, fd)
         result = {}
         result['loss'] = np.mean([r['loss'] for r in results])
         result['loss_variance'] = np.var([r['loss'] for r in results])
@@ -110,6 +122,7 @@ def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random
         result['train_time'] = [r['train_time'] for r in results]
         result['params'] = params
         result['status'] = STATUS_OK
+        result['id'] = id_
         return result
     return fit_model_
 
@@ -129,7 +142,7 @@ def main():
 @click.option('--task_filter', default='none', help='classification/regression/all', required=False)
 @click.option('--force_task', default=None, help='classification/regression/all', required=False)
 @click.option('--nb_datasets', default=None, help='Max Nb of datasets', required=False)
-@click.option('--save_results', default=True, help='Save results in DB', required=False)
+@click.option('--save-results/--no-save-results', default=True, help='Save results in DB', required=False)
 @click.option('--n_jobs', default=-1, help='n_jobs', required=False)
 @click.option('--models', default='earth', help='earth/random_forest separated by ,', required=False)
 @click.command()
@@ -232,7 +245,8 @@ def export(out, task_filter, dataset_pattern):
         params = db.get_value(j, 'content.params')
         for k, v in params.items():
             df[k].append(v)
-
+        df['id'] = db.get_value(j, 'content.result.id')
+        df['summary'] = db.get_value(j, 'summary')
         train = db.get_value(j, 'content.result.score_train')
         df['train_mean'].append((np.mean(train)))
         df['train_std'].append(np.std(train))
