@@ -24,7 +24,7 @@ from models import MODELS
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-def get_datasets(filenames, task=None):
+def get_datasets(filenames, task=None, x_col='X', y_col='y'):
     datasets = {}
     for filename in filenames:
         logger.info('Processing {}'.format(filename))
@@ -36,10 +36,10 @@ def get_datasets(filenames, task=None):
                 X, y = data[:, 0:-1], data[:, -1]
             elif filename.endswith('npz'):
                 data = np.load(filename)
-                X = data['X']
+                X = data[x_col]
                 if len(X.shape) > 2:
                     X = X.reshape((X.shape[0], -1))
-                y = data['y']
+                y = data[y_col]
             else:
                 data = pd.read_csv(filename)
                 data = data.values
@@ -112,7 +112,7 @@ def build_fit_function_kfold(X, y, CLS, n_folds=5, preprocess=lambda p:p, random
         
         id_ = str(uuid.uuid4())
         models = [r['model'] for r in results]
-        with open('dump/{}.pkl'.format(id_), 'w') as fd:
+        with open('dump/{}.pkl'.format(id_), 'wb') as fd:
             pickle.dump(models, fd)
         result = {}
         result['loss'] = np.mean([r['loss'] for r in results])
@@ -145,8 +145,10 @@ def main():
 @click.option('--save-results/--no-save-results', default=True, help='Save results in DB', required=False)
 @click.option('--n_jobs', default=-1, help='n_jobs', required=False)
 @click.option('--models', default='earth', help='earth/random_forest separated by ,', required=False)
+@click.option('--x-col', default='X', help='X col name for numpy datasets', required=False)
+@click.option('--y-col', default='y', help='y col name for numpy datasets', required=False)
 @click.command()
-def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_task, nb_datasets, save_results, n_jobs, models):
+def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_task, nb_datasets, save_results, n_jobs, models, x_col, y_col):
     from lightjob.cli import load_db
     from lightjob.db import SUCCESS
     import glob
@@ -155,9 +157,10 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
     filenames = glob.glob(pattern)
     filenames_exclude = set(glob.glob(exclude))
     filenames = filter(lambda f:f not in filenames_exclude, filenames)
+    filenames = list(filenames)
 
     logger.info('total number of datasets before filtering : {}'.format(len(filenames)))
-    datasets = get_datasets(filenames, task=force_task)
+    datasets = get_datasets(filenames, task=force_task, x_col=x_col, y_col=y_col)
     
     datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if X.shape[1] > 0}
     datasets = {k: (X, y, task) for k, (X, y, task) in datasets.items() if X.shape[0] > 100}
@@ -178,14 +181,14 @@ def run(pattern, exclude, max_evals, n_folds, random_state, task_filter, force_t
         datasets_new = []
         for filename, (X, y, task) in datasets:
             CLS = model_getter[task]['cls']
-            length = len(db.jobs_with(model=CLS.__name__, seed=random_state, task=task, dataset=filename))
+            length = len(list(db.jobs_with(model=CLS.__name__, seed=random_state, task=task, dataset=filename)))
             if length >= max_evals:
                 logger.info('Skipping job on {}...already exists'.format(filename))
                 continue
             else:
                 datasets_new.append((filename, (X, y, task)))
-        results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
-        #results = [get_result(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets]
+        #results = Parallel(n_jobs=n_jobs)(delayed(get_result)(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets)
+        results = [get_result(filename, X, y, task, model_getter[task]) for filename, (X, y, task) in datasets]
         for r in results:
             for r_indiv in r:
                 yield r_indiv

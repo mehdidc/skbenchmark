@@ -1,9 +1,11 @@
+import numpy as np
 from pyearth import Earth
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.multiclass import OneVsRestClassifier
 
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
@@ -84,9 +86,22 @@ rf_reg_params = dict(
     bootstrap=hp.choice('bootstrap', (True, False))
 )
 
-rf_classif_params = rf_reg_params.copy()
-rf_classif_params['criterion'] =hp.choice('criterion', ('gini', 'entropy'))
 
+rf_classif_params = rf_reg_params.copy()
+rf_classif_params['criterion'] = hp.choice('criterion', ('gini', 'entropy'))
+
+gbt_reg_params = dict(
+    n_estimators=hp.quniform('n_estimators', 10, 100, 1),
+    min_samples_split=hp.quniform('min_samples_split', 2, 20, 1),
+    min_samples_leaf=hp.quniform('min_samples_leaf', 2, 20, 1),
+    max_depth=hp.choice('max_depth', (hp.quniform('max_depth_val', 5, 50, 1), None)),
+    learning_rate=hp.loguniform('learning_rate', np.log(10) * -4, np.log(10) * -1),
+    max_features=hp.choice('max_features', ('sqrt', 'log2', None)),
+    loss=hp.choice('loss', ('ls', 'lad', 'huber', 'quantile'))
+)
+
+gbt_classif_params = gbt_reg_params.copy()
+gbt_classif_params['loss'] = hp.choice('loss', ('deviance', 'exponential'))
 
 def preprocess_rf_params(p):
     keys = ['n_estimators', 'min_samples_split', 'min_samples_leaf']
@@ -95,13 +110,22 @@ def preprocess_rf_params(p):
     p['n_jobs'] = -1
     return p
 
+def preprocess_gbt_params(p):
+    p = preprocess_rf_params(p)
+    del p['n_jobs']
+    return p
+
 MODELS = {
    'random_forest': {
          'classification': {'cls': RandomForestClassifier, 'params': rf_classif_params, 'preprocess': preprocess_rf_params}, 
          'regression': {'cls': RandomForestRegressor, 'params': rf_reg_params, 'preprocess': preprocess_rf_params}
     },
-   'earth': {
-            'classification': {'cls': EarthOneVsRestClassifier, 'params': earth_params}, 
-            'regression': {'cls': Earth, 'params': earth_params}
+   'boosted_trees':{
+       'classification': {'cls': GradientBoostingClassifier, 'params': gbt_classif_params, 'preprocess' : preprocess_gbt_params},
+       'regression': {'cls': GradientBoostingRegressor, 'params': gbt_reg_params, 'preprocess' : preprocess_gbt_params},
+    },
+    'earth': {
+       'classification': {'cls': EarthOneVsRestClassifier, 'params': earth_params}, 
+       'regression': {'cls': Earth, 'params': earth_params}
     }
 }
